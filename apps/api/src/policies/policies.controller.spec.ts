@@ -45,7 +45,11 @@ jest.mock('@db', () => ({
       findFirst: jest.fn(),
       update: jest.fn(),
     },
+    requirementMap: {
+      findMany: jest.fn(),
+    },
     frameworkControlPolicyLink: {
+      createMany: jest.fn(),
       deleteMany: jest.fn(),
     },
     $transaction: jest.fn(),
@@ -682,16 +686,79 @@ describe('PoliciesController', () => {
                 }),
               }),
             }),
+            frameworkControlLinks: expect.objectContaining({
+              where: {
+                frameworkInstance: { organizationId: orgId },
+                control: { organizationId: orgId, archivedAt: null },
+              },
+            }),
           }),
         }),
       );
     });
+
+    it('includes controls linked only via FrameworkControlPolicyLink and deduplicates against direct controls (#3553)', async () => {
+      const { db } = require('@db');
+      const ctrl1 = {
+        id: 'ctrl_1',
+        name: 'Access Rights',
+        description: 'Direct control',
+        requirementsMapped: [],
+      };
+      const ctrl2 = {
+        id: 'ctrl_2',
+        name: 'Data Privacy',
+        description: 'Framework-scoped control',
+        requirementsMapped: [
+          {
+            frameworkInstance: {
+              id: 'fi_soc2',
+              framework: { id: 'fw_soc2', name: 'SOC 2' },
+              customFramework: null,
+            },
+          },
+        ],
+      };
+
+      db.policy.findFirst.mockResolvedValue({
+        id: 'pol_1',
+        controls: [ctrl1],
+        frameworkControlLinks: [{ control: ctrl1 }, { control: ctrl2 }],
+      });
+      db.control.findMany.mockResolvedValue([ctrl1, ctrl2]);
+
+      const result = await controller.getPolicyControls(
+        'pol_1',
+        orgId,
+        mockAuthContext,
+      );
+
+      expect(result.mappedControls).toEqual([
+        {
+          id: 'ctrl_1',
+          name: 'Access Rights',
+          description: 'Direct control',
+          frameworks: [],
+        },
+        {
+          id: 'ctrl_2',
+          name: 'Data Privacy',
+          description: 'Framework-scoped control',
+          frameworks: [{ id: 'fw_soc2', name: 'SOC 2' }],
+        },
+      ]);
+    });
   });
 
   describe('addPolicyControls', () => {
-    it('should connect controls to policy and return success', async () => {
+    it('should connect controls to policy and populate FrameworkControlPolicyLink rows for mapped framework instances (#3553)', async () => {
       const { db } = require('@db');
       db.policy.update.mockResolvedValue({});
+      db.requirementMap.findMany.mockResolvedValue([
+        { controlId: 'ctrl_1', frameworkInstanceId: 'fi_soc2' },
+        { controlId: 'ctrl_2', frameworkInstanceId: 'fi_iso' },
+      ]);
+      db.frameworkControlPolicyLink.createMany.mockResolvedValue({ count: 2 });
 
       const result = await controller.addPolicyControls(
         'pol_1',
@@ -707,6 +774,33 @@ describe('PoliciesController', () => {
             connect: [{ id: 'ctrl_1' }, { id: 'ctrl_2' }],
           },
         },
+      });
+      expect(db.requirementMap.findMany).toHaveBeenCalledWith({
+        where: {
+          controlId: { in: ['ctrl_1', 'ctrl_2'] },
+          archivedAt: null,
+          frameworkInstance: { organizationId: orgId },
+        },
+        select: {
+          controlId: true,
+          frameworkInstanceId: true,
+        },
+        distinct: ['controlId', 'frameworkInstanceId'],
+      });
+      expect(db.frameworkControlPolicyLink.createMany).toHaveBeenCalledWith({
+        data: [
+          {
+            frameworkInstanceId: 'fi_soc2',
+            controlId: 'ctrl_1',
+            policyId: 'pol_1',
+          },
+          {
+            frameworkInstanceId: 'fi_iso',
+            controlId: 'ctrl_2',
+            policyId: 'pol_1',
+          },
+        ],
+        skipDuplicates: true,
       });
       expect(result.success).toBe(true);
     });

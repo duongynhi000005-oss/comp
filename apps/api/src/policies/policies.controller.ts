@@ -271,6 +271,15 @@ export class PoliciesController {
         select: {
           id: true,
           controls: { where: { archivedAt: null }, select: controlSelect },
+          frameworkControlLinks: {
+            where: {
+              frameworkInstance: { organizationId },
+              control: { organizationId, archivedAt: null },
+            },
+            select: {
+              control: { select: controlSelect },
+            },
+          },
         },
       }),
       db.control.findMany({
@@ -312,8 +321,20 @@ export class PoliciesController {
         };
       });
 
+    const seenControlIds = new Set<string>();
+    const rawMappedControls: RawControl[] = [];
+    for (const control of [
+      ...(policy?.controls ?? []),
+      ...(policy?.frameworkControlLinks ?? []).map((link) => link.control),
+    ]) {
+      if (!seenControlIds.has(control.id)) {
+        seenControlIds.add(control.id);
+        rawMappedControls.push(control);
+      }
+    }
+
     return {
-      mappedControls: transform(policy?.controls ?? []),
+      mappedControls: transform(rawMappedControls),
       allControls: transform(allControls),
       authType: authContext.authType,
       ...(authContext.userId && {
@@ -337,30 +358,41 @@ export class PoliciesController {
     @OrganizationId() organizationId: string,
     @AuthContext() authContext: AuthContextType,
   ) {
+    const evidenceControlSelect = {
+      id: true,
+      name: true,
+      tasks: {
+        where: { archivedAt: null, organizationId },
+        select: {
+          id: true,
+          title: true,
+          status: true,
+          frequency: true,
+          department: true,
+          automationStatus: true,
+          assigneeId: true,
+        },
+        orderBy: { title: 'asc' },
+      },
+    } as const;
+
     const policy = await db.policy.findFirst({
       where: { id, organizationId, archivedAt: null },
       select: {
         id: true,
         controls: {
           where: { archivedAt: null, organizationId },
-          select: {
-            id: true,
-            name: true,
-            tasks: {
-              where: { archivedAt: null, organizationId },
-              select: {
-                id: true,
-                title: true,
-                status: true,
-                frequency: true,
-                department: true,
-                automationStatus: true,
-                assigneeId: true,
-              },
-              orderBy: { title: 'asc' },
-            },
-          },
+          select: evidenceControlSelect,
           orderBy: { name: 'asc' },
+        },
+        frameworkControlLinks: {
+          where: {
+            frameworkInstance: { organizationId },
+            control: { archivedAt: null, organizationId },
+          },
+          select: {
+            control: { select: evidenceControlSelect },
+          },
         },
       },
     });
@@ -369,7 +401,19 @@ export class PoliciesController {
       throw new NotFoundException('Policy not found');
     }
 
-    const data = policy.controls.map((control) => ({
+    const seenControlIds = new Set<string>();
+    const mergedControls = [
+      ...(policy.controls ?? []),
+      ...(policy.frameworkControlLinks ?? []).map((link) => link.control),
+    ]
+      .filter((control) => {
+        if (seenControlIds.has(control.id)) return false;
+        seenControlIds.add(control.id);
+        return true;
+      })
+      .sort((a, b) => a.name.localeCompare(b.name));
+
+    const data = mergedControls.map((control) => ({
       control: { id: control.id, name: control.name },
       tasks: control.tasks,
     }));
@@ -983,6 +1027,33 @@ export class PoliciesController {
         },
       },
     });
+
+    if (body.controlIds.length > 0) {
+      const requirementMaps =
+        (await db.requirementMap?.findMany({
+          where: {
+            controlId: { in: body.controlIds },
+            archivedAt: null,
+            frameworkInstance: { organizationId },
+          },
+          select: {
+            controlId: true,
+            frameworkInstanceId: true,
+          },
+          distinct: ['controlId', 'frameworkInstanceId'],
+        })) ?? [];
+
+      if (requirementMaps.length > 0) {
+        await db.frameworkControlPolicyLink.createMany({
+          data: requirementMaps.map((rm) => ({
+            frameworkInstanceId: rm.frameworkInstanceId,
+            controlId: rm.controlId,
+            policyId: id,
+          })),
+          skipDuplicates: true,
+        });
+      }
+    }
 
     return {
       success: true,
