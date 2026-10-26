@@ -27,6 +27,14 @@ jest.mock('../auth/service-token.config', () => ({
     resolveServiceByNameMock(...args),
 }));
 
+const resolveRolePermissionsMock = jest.fn();
+const permissionsGrantMock = jest.fn();
+jest.mock('../auth/app-access', () => ({
+  resolveRolePermissions: (...args: unknown[]) =>
+    resolveRolePermissionsMock(...args),
+  permissionsGrant: (...args: unknown[]) => permissionsGrantMock(...args),
+}));
+
 jest.mock('../auth/auth.server', () => ({
   auth: { api: { hasPermission: jest.fn() } },
 }));
@@ -41,7 +49,10 @@ type MockRequest = {
   headers: Record<string, string>;
   isApiKey?: boolean;
   isServiceToken?: boolean;
+  isMcpOAuth?: boolean;
   isPlatformAdmin?: boolean;
+  organizationId?: string;
+  userRoles?: string[] | null;
 };
 
 function makeContext(request: MockRequest): ExecutionContext {
@@ -261,5 +272,60 @@ describe('CommentsPermissionGuard', () => {
       headers: {},
     });
     await expect(guard.canActivate(context)).resolves.toBe(true);
+  });
+
+  it('allows MCP OAuth requests when resolved role permissions grant the entity action (#3554)', async () => {
+    const resolvedPerms = { task: ['read', 'update'] };
+    resolveRolePermissionsMock.mockResolvedValueOnce(resolvedPerms);
+    permissionsGrantMock.mockReturnValueOnce(true);
+
+    const guard = new CommentsPermissionGuard(
+      reflectorWith('task', 'update'),
+    );
+    const context = makeContext({
+      method: 'POST',
+      body: { entityType: 'task', entityId: 'tsk_1', content: 'hello' },
+      headers: { authorization: 'Bearer mcp_token' },
+      isMcpOAuth: true,
+      organizationId: 'org_123',
+      userRoles: ['owner'],
+    });
+
+    await expect(guard.canActivate(context)).resolves.toBe(true);
+    expect(resolveRolePermissionsMock).toHaveBeenCalledWith('org_123', [
+      'owner',
+    ]);
+    expect(permissionsGrantMock).toHaveBeenCalledWith(
+      resolvedPerms,
+      'task',
+      'update',
+    );
+    expect(hasPermissionMock).not.toHaveBeenCalled();
+  });
+
+  it('rejects MCP OAuth requests with Access denied when resolved role permissions lack the entity action (#3554)', async () => {
+    const resolvedPerms = { task: ['read'] };
+    resolveRolePermissionsMock.mockResolvedValueOnce(resolvedPerms);
+    permissionsGrantMock.mockReturnValueOnce(false);
+
+    const guard = new CommentsPermissionGuard(
+      reflectorWith('task', 'update'),
+    );
+    const context = makeContext({
+      method: 'POST',
+      body: { entityType: 'finding', entityId: 'fnd_1', content: 'note' },
+      headers: { authorization: 'Bearer mcp_token' },
+      isMcpOAuth: true,
+      organizationId: 'org_123',
+      userRoles: ['member'],
+    });
+
+    await expect(guard.canActivate(context)).rejects.toThrow('Access denied');
+    expect(permissionsGrantMock).toHaveBeenCalledWith(
+      resolvedPerms,
+      'finding',
+      'update',
+    );
+    expect(hasPermissionMock).not.toHaveBeenCalled();
   });
 });

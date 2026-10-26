@@ -8,6 +8,7 @@ import {
 import { Reflector } from '@nestjs/core';
 import { CommentEntityType } from '@db';
 import type { Request } from 'express';
+import { permissionsGrant, resolveRolePermissions } from '../auth/app-access';
 import { auth } from '../auth/auth.server';
 import {
   PERMISSIONS_KEY,
@@ -107,6 +108,24 @@ export class CommentsPermissionGuard implements CanActivate {
           `[CommentsPermissionGuard] Service "${request.serviceName}" lacks ${requiredScope}`,
         );
         throw new ForbiddenException('Service token lacks required permission');
+      }
+      return true;
+    }
+
+    // MCP OAuth tokens are not better-auth sessions, so `hasPermission` (which
+    // resolves a session + active org) can't authorize them. Check the resolved
+    // entity permission against the roles HybridAuthGuard already resolved for
+    // the bound org (mirrors PermissionGuard's MCP OAuth handling).
+    if (request.isMcpOAuth) {
+      const perms = await resolveRolePermissions(
+        request.organizationId,
+        request.userRoles ?? [],
+      );
+      if (!permissionsGrant(perms, resource, action)) {
+        this.logger.warn(
+          `[CommentsPermissionGuard] MCP OAuth access denied for ${request.method} ${request.url}. Required: ${requiredScope}`,
+        );
+        throw new ForbiddenException('Access denied');
       }
       return true;
     }
